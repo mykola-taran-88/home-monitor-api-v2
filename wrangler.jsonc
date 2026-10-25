@@ -1,0 +1,5 @@
+{
+  "name": "smart-home-api-v2",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-25",
+}
