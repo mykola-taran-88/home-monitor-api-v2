@@ -1,8 +1,10 @@
 // @ts-nocheck
-// Home Monitor API v5.6 Display Layer - backward-compatible facade for ESP32-2432S028
+// GitHub transition: API version updated to 5.6.1 in the repository.
+// Home Monitor API v5.6.1 Display Layer - backward-compatible facade for ESP32-2432S028
 // Worker: smart-home-api-v2
 // Required binding: DB
 // Optional secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+const API_VERSION = "5.6.1";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -947,7 +949,7 @@ async function rangeAnalytics(env, from, to) {
 }
 
 // -----------------------------------------------------------------------------
-// v5.6 DISPLAY LAYER
+// v5.6.1 DISPLAY LAYER
 // Compact, read-only payloads for ESP32-2432S028 / LVGL.
 // Existing v5.5 endpoints remain backward-compatible.
 // -----------------------------------------------------------------------------
@@ -966,7 +968,7 @@ const roundOrNull = (v, d = 1) =>
 const displayMeta = (screen, ttl, extra = {}) => ({
   screen,
   schema_version: DISPLAY_VERSION,
-  api_version: "5.6",
+  api_version: API_VERSION,
   generated_at: new Date().toISOString(),
   freshness_seconds: ttl,
   ...extra,
@@ -1461,7 +1463,7 @@ async function displayIntelligence(env) {
     data_confidence: {
       value: null,
       status: "unavailable",
-      reason: "API v5.6 has no persisted confidence model",
+      reason: `API v${API_VERSION} has no persisted confidence model`,
     },
     device_health: {
       online: devices.online,
@@ -1485,7 +1487,7 @@ async function displaySystem(env) {
     success: true,
     meta: displayMeta("system", DISPLAY_FRESHNESS.system),
     services: {
-      worker: { status: "online", version: "5.6" },
+      worker: { status: "online", version: API_VERSION },
       api: { status: "healthy" },
       d1: { status: db?.ok === 1 ? "online" : "unknown" },
       cache: {
@@ -1516,14 +1518,14 @@ export default {
       if (path === "/api/v1/status")
         return json({
           project: "Home Monitor",
-          version: "5.6",
+          version: API_VERSION,
           status: "online",
           display_layer: DISPLAY_VERSION,
           timestamp: new Date().toISOString(),
         });
       if (path === "/api/v1/debug")
         return json({
-          version: "5.6",
+          version: API_VERSION,
           path,
           host: url.host,
           display_layer: DISPLAY_VERSION,
@@ -1575,7 +1577,7 @@ export default {
             wet = [...indoor].sort((a, b) => b.humidity - a.humidity);
           return {
             success: true,
-            project: { name: "Home Monitor", version: "5.6" },
+            project: { name: "Home Monitor", version: API_VERSION },
             insights: {
               climate: {
                 zones: data.zones,
