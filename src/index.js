@@ -774,6 +774,7 @@ async function updateWeather(env) {
     dp = dewPoint(w.current.temperature_2m, w.current.relative_humidity_2m),
     today = localDate(new Date(), tz),
     tomorrow = localDate(new Date(Date.now() + 86400000), tz),
+    dayAfterTomorrow = localDate(new Date(Date.now() + 2 * 86400000), tz),
     hourly = w.hourly.time
       .map((time, i) => ({
         time,
@@ -786,7 +787,9 @@ async function updateWeather(env) {
       }))
       .filter(
         (x) =>
-          (x.time.startsWith(today) || x.time.startsWith(tomorrow)) &&
+          [today, tomorrow, dayAfterTomorrow].some((date) =>
+            x.time.startsWith(date),
+          ) &&
           +x.time.slice(11, 13) % 3 === 0,
       ),
     daily = w.daily.time.map((date, i) => ({
