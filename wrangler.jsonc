@@ -2,4 +2,11 @@
   "name": "smart-home-api-v2",
   "main": "src/index.js",
   "compatibility_date": "2026-10-25",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "DB",
+      "database_id": "a572cb01-5eaa-49cf-8646-ef4fba5b59f0",
+    },
+  ],
 }
