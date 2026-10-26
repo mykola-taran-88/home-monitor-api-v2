@@ -4,6 +4,7 @@
 // Worker: smart-home-api-v2
 // Required binding: DB
 // Optional secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+import { V5_DEFAULTS, calculateBillForecast, calculateSleepScore, climateCandidates, explainHomeScore, fingerprint, shouldRefreshBill, shouldSuppressResolvedRecommendation, transitionAnomaly } from "./v5/engines.js";
 const API_VERSION = "5.6.1";
 
 const CORS = {
@@ -158,6 +159,11 @@ const safeSettingKeys = new Set([
   "rain_alert_probability",
   "ventilation_humidity_threshold",
   "telegram_enabled",
+  ...Object.keys(V5_DEFAULTS),
+  "bill_change_pct",
+  "bill_change_uah",
+  "high_priority_reminder_hours",
+  "climate_expected_interval_min",
 ]);
 const n = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
 const clamp = (v) => Math.max(0, Math.min(100, Math.round(v)));
@@ -293,7 +299,7 @@ async function latestBundle(env) {
       "SELECT * FROM alerts WHERE resolved_at IS NULL ORDER BY id DESC",
     ).all(),
     env.DB.prepare(
-      "SELECT * FROM recommendations WHERE status='active' ORDER BY score DESC LIMIT 20",
+      "SELECT r.*,l.fingerprint,l.occurrence_count,l.first_seen_at,l.last_seen_at,l.last_notified_at,l.snooze_until FROM recommendations r LEFT JOIN recommendation_lifecycle l ON l.recommendation_key=r.recommendation_key WHERE r.status='active' AND (l.snooze_until IS NULL OR l.snooze_until<=CURRENT_TIMESTAMP) ORDER BY r.score DESC LIMIT 20",
     ).all(),
   ]);
   return { zones, power, weather, alerts: alerts.results, recs: recs.results };
@@ -323,18 +329,20 @@ async function tariff(env) {
     time,
   };
 }
-async function periodStats(env, start) {
+async function periodStats(env, start, end = null) {
   const r = await env.DB.prepare(
-    "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE created_at>=? OR id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at",
+    end
+      ? "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE (created_at>=? AND created_at<?) OR id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at"
+      : "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE created_at>=? OR id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at",
   )
-    .bind(start, start)
+    .bind(...(end ? [start, end, start] : [start, start]))
     .all();
   let day = 0,
     night = 0,
     costDay = 0,
     costNight = 0;
   for (let i = 1; i < r.results.length; i++) {
-    if (String(r.results[i].created_at) < start) continue;
+    if (String(r.results[i].created_at) < start || (end && String(r.results[i].created_at) >= end)) continue;
     const d = n(r.results[i].energy_total) - n(r.results[i - 1].energy_total);
     if (!Number.isFinite(d) || d < 0) continue;
     const cost = d * n(r.results[i].cost_per_kwh);
@@ -382,23 +390,83 @@ function periodStarts() {
     ),
     off = kyivOffsetMinutes(now),
     toSql = (d) => new Date(d).toISOString().slice(0, 19).replace("T", " "),
+    localMidnightUtc = (year, month, day) => {
+      const wall = Date.UTC(year, month - 1, day);
+      let value = wall - 120 * 60000;
+      for (let i = 0; i < 3; i++) value = wall - kyivOffsetMinutes(new Date(value)) * 60000;
+      return value;
+    },
     todayUtc =
-      Date.UTC(+parts.year, +parts.month - 1, +parts.day) - off * 60000,
-    monthUtc = Date.UTC(+parts.year, +parts.month - 1, 1) - off * 60000;
+      localMidnightUtc(+parts.year, +parts.month, +parts.day),
+    monthUtc = localMidnightUtc(+parts.year, +parts.month, 1),
+    previousMonthDate = new Date(Date.UTC(+parts.year, +parts.month - 2, 1)),
+    previousMonthUtc = localMidnightUtc(previousMonthDate.getUTCFullYear(), previousMonthDate.getUTCMonth() + 1, 1);
   return {
     today: toSql(todayUtc),
     month: toSql(monthUtc),
+    previous_month: toSql(previousMonthUtc),
     timezone: "Europe/Kyiv",
     offset_minutes: off,
   };
 }
 async function powerStats(env) {
   const p = periodStarts(),
-    [today, month] = await Promise.all([
+    [today, month, previousMonth] = await Promise.all([
       periodStats(env, p.today),
       periodStats(env, p.month),
+      periodStats(env, p.previous_month, p.month),
     ]);
-  return { today, month };
+  return { today, month, previousMonth };
+}
+
+function localWallToUtc(date, time, timezone = "Europe/Kyiv") {
+  const [y, m, d] = date.split("-").map(Number), [hh, mm] = time.split(":").map(Number),
+    wall = Date.UTC(y, m - 1, d, hh, mm);
+  let utc = wall - kyivOffsetMinutes(new Date(wall)) * 60000;
+  for (let i = 0; i < 4; i++) utc = wall - kyivOffsetMinutes(new Date(utc)) * 60000;
+  return new Date(utc).toISOString().slice(0, 19).replace("T", " ");
+}
+
+async function calculateLatestSleepScore(env) {
+  const s = await settings(env, ["sleep_start", "sleep_end", "climate_expected_interval_min"]),
+    today = localDate(new Date()), [y, m, d] = today.split("-").map(Number),
+    todayAtMidnight = Date.UTC(y, m - 1, d),
+    sleepDate = today,
+    previousDay = new Date(todayAtMidnight - 86400000).toISOString().slice(0, 10),
+    endLocal = s.sleep_end || "07:00", startLocal = s.sleep_start || "22:00",
+    nowLocal = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Kyiv", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
+  if (nowLocal < endLocal) return null;
+  const from = localWallToUtc(previousDay, startLocal), to = localWallToUtc(sleepDate, endLocal),
+    devices = (await env.DB.prepare("SELECT device_id,device_name FROM devices WHERE device_type='climate' AND enabled=1 AND is_outdoor=0").all()).results,
+    samples = (await env.DB.prepare("SELECT device_id,temperature,humidity,created_at FROM climate_logs WHERE created_at>=? AND created_at<? ORDER BY created_at").bind(from,to).all()).results,
+    windowMinutes = Math.max(1,(Date.parse(`${to.replace(" ","T")}Z`)-Date.parse(`${from.replace(" ","T")}Z`))/60000),
+    expectedInterval = Math.max(1,n(s.climate_expected_interval_min,5)),
+    expected = Math.max(1,devices.length*windowMinutes/expectedInterval),
+    coverage = Math.min(1,samples.length/expected),
+    comfortSamples = samples.filter(x => Number.isFinite(Number(x.temperature)) && Number.isFinite(Number(x.humidity))),
+    climate = comfortSamples.length ? comfortSamples.reduce((sum,x)=>sum+comfort(x.temperature,x.humidity,x.device_id),0)/comfortSamples.length*0.4 : null,
+    devicesSeen = new Set(samples.map(x=>x.device_id)).size,
+    reliability = devices.length ? 25*devicesSeen/devices.length : null,
+    alerts = (await env.DB.prepare("SELECT severity,alert_type,alert_message FROM alerts WHERE created_at>=? AND created_at<?").bind(from,to).all()).results,
+    events = 15*Math.max(0,1-alerts.length/5),
+    energyRows = (await env.DB.prepare("SELECT energy_total,created_at FROM power_logs WHERE created_at>=? AND created_at<? ORDER BY created_at").bind(from,to).all()).results;
+  let nightKwh = null;
+  if (energyRows.length >= 2) {
+    const delta = n(energyRows.at(-1).energy_total)-n(energyRows[0].energy_total);
+    if (delta >= 0 && delta <= 500) nightKwh = delta;
+  }
+  // No energy penalty is applied until a reliable multi-night baseline exists.
+  const score = calculateSleepScore({ climate, reliability, energy: null, events }),
+    reasons = [];
+  if (!comfortSamples.length) reasons.push("Недостатньо кліматичних даних.");
+  const avgHumidity = comfortSamples.length ? comfortSamples.reduce((sum,x)=>sum+n(x.humidity),0)/comfortSamples.length : null;
+  if (avgHumidity != null && avgHumidity > 70) reasons.push(`Вологість була високою в середньому ${avgHumidity.toFixed(0)}%.`);
+  if (!devices.length) reasons.push("Не налаштовано кімнатних датчиків.");
+  const components = { ...score, coverage: Math.round(coverage*100), night_energy_kwh: nightKwh, night_energy_available: nightKwh != null, devices_seen: devicesSeen, devices_total: devices.length, events_count: alerts.length };
+  await env.DB.prepare(
+    "INSERT INTO house_sleep_scores(sleep_date,window_start_utc,window_end_utc,score,confidence,components_json,reasons_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(sleep_date) DO UPDATE SET window_start_utc=excluded.window_start_utc,window_end_utc=excluded.window_end_utc,score=excluded.score,confidence=excluded.confidence,components_json=excluded.components_json,reasons_json=excluded.reasons_json,created_at=CURRENT_TIMESTAMP",
+  ).bind(sleepDate,from,to,score.score,score.confidence,JSON.stringify(components),JSON.stringify(reasons)).run();
+  return { sleep_date:sleepDate, ...components, reasons };
 }
 
 async function setAlert(env, a) {
@@ -534,12 +602,114 @@ async function evaluateAlerts(env) {
   }
 }
 
+async function runClimateAnomalyEngine(env, s) {
+  const samples = (
+      await env.DB.prepare(
+        "SELECT d.device_name,c.device_id,c.temperature,c.humidity,c.created_at FROM climate_logs c JOIN devices d ON d.device_id=c.device_id WHERE c.created_at>=datetime('now','-130 minutes') AND d.device_type='climate' AND d.enabled=1 ORDER BY c.created_at",
+      ).all()
+    ).results,
+    candidates = climateCandidates(samples, s),
+    activeRows = (
+      await env.DB.prepare(
+        "SELECT * FROM climate_anomalies WHERE status IN ('pending','active','recovering')",
+      ).all()
+    ).results,
+    byKey = new Map(activeRows.map((x) => [x.anomaly_key, x])),
+    byCandidate = new Map(candidates.map((x) => [x.key, x])),
+    allKeys = new Set([...byKey.keys(), ...byCandidate.keys()]),
+    active = [];
+  for (const key of allKeys) {
+    const previous = byKey.get(key), candidate = byCandidate.get(key),
+      nowIso = new Date().toISOString().slice(0, 19).replace("T", " ");
+    let next = transitionAnomaly(previous, !!candidate, nowIso);
+    if (candidate && next.status === "active" && previous?.status === "active")
+      next = { ...next, opened_at: previous.opened_at };
+    if (!candidate && previous?.status === "recovering") {
+      const recovered = new Date(String(previous.recovered_since || "").replace(" ", "T") + "Z").getTime();
+      if (Number.isFinite(recovered) && Date.now() - recovered < 30 * 60000)
+        next = { status: "recovering", recovered_since: previous.recovered_since, active: false };
+    }
+    if (candidate && next.status === "active") {
+      const device = samples.find((x) => String(x.device_id) === String(candidate.device_id));
+      active.push({ ...candidate, device_name: device?.device_name || candidate.device_id });
+    } else if (!candidate && next.status === "recovering" && previous) {
+      const source = activeRows.find((x) => x.id === previous.id);
+      if (source) active.push({ ...source, key, device_name: source.device_id, recovering: true });
+    }
+    const evidence = candidate || previous || {};
+    if (previous) {
+      await env.DB.prepare(
+        "UPDATE climate_anomalies SET status=?,pending_since=COALESCE(?,pending_since),opened_at=COALESCE(?,opened_at),recovered_since=?,resolved_at=CASE WHEN ?='normal' THEN CURRENT_TIMESTAMP ELSE resolved_at END,last_value=?,delta=?,sample_count=?,coverage=?,evidence_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+      ).bind(next.status, next.pending_since || null, next.opened_at || null, next.recovered_since || null, next.status, candidate?.current ?? candidate?.value ?? previous.last_value, candidate?.value ?? previous.delta, candidate?.samples ?? previous.sample_count, candidate?.coverage ?? previous.coverage, JSON.stringify(evidence), previous.id).run();
+    } else if (candidate) {
+      await env.DB.prepare(
+        "INSERT INTO climate_anomalies(anomaly_key,device_id,anomaly_type,status,pending_since,opened_at,first_value,last_value,delta,sample_count,coverage,evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+      ).bind(key, candidate.device_id, candidate.type, next.status, next.pending_since || nowIso, next.opened_at || null, candidate.first ?? candidate.value, candidate.current ?? candidate.value, candidate.value, candidate.samples || 0, candidate.coverage ?? null, JSON.stringify(candidate)).run();
+    }
+  }
+  return active;
+}
+
+async function persistRecommendations(env, candidates, settings, billMeta) {
+  const keys = new Set();
+  for (const item of candidates) {
+    const key = String(item.key), current = await env.DB.prepare(
+      "SELECT * FROM recommendation_lifecycle WHERE recommendation_key=?",
+    ).bind(key).first(),
+      isBill = key === "bill",
+      metadata = isBill ? { ...billMeta, forecast_cost: item.bill?.forecastCost, date: localDate(new Date()) } : item.evidence || {},
+      fp = fingerprint(isBill
+        ? { key, bill: metadata }
+        : { key, category: item.category, title: item.title, action: item.action, priority: item.priority });
+    keys.add(key);
+    if (shouldSuppressResolvedRecommendation(current,fp)) continue;
+    if (isBill && current?.active && !shouldRefreshBill(current, item.bill || {}, settings, metadata.date, metadata.tariff_key)) {
+      await env.DB.prepare("UPDATE recommendation_lifecycle SET last_seen_at=CURRENT_TIMESTAMP WHERE recommendation_key=?").bind(key).run();
+      continue;
+    }
+    const existing = await env.DB.prepare(
+      "SELECT id FROM recommendations WHERE recommendation_key=? AND status='active' ORDER BY id DESC LIMIT 1",
+    ).bind(key).first(),
+      changed = !current?.active || current.fingerprint !== fp,
+      occurrence = Number(current?.occurrence_count || 0) + (changed ? 1 : 0),
+      metadataJson = JSON.stringify(metadata);
+    if (existing) {
+      await env.DB.prepare(
+        "UPDATE recommendations SET category=?,priority=?,title=?,message=?,action=?,source='engine',room_id=?,score=?,confidence=?,expires_at=datetime('now','+2 hours'),metadata_json=? WHERE id=?",
+      ).bind(item.category, item.priority, item.title, item.message, item.action || null, item.room_id || null, item.score, item.confidence, metadataJson, existing.id).run();
+      await env.DB.prepare(
+        "UPDATE recommendations SET status='expired',resolved_at=CURRENT_TIMESTAMP WHERE recommendation_key=? AND status='active' AND id<>?",
+      ).bind(key, existing.id).run();
+    } else {
+      await env.DB.prepare(
+        "INSERT INTO recommendations(recommendation_key,category,priority,title,message,action,source,room_id,score,confidence,status,expires_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,'active',datetime('now','+2 hours'),?)",
+      ).bind(key, item.category, item.priority, item.title, item.message, item.action || null, "engine", item.room_id || null, item.score, item.confidence, metadataJson).run();
+    }
+    await env.DB.prepare(
+      "INSERT INTO recommendation_lifecycle(recommendation_key,fingerprint,active,occurrence_count,first_seen_at,last_seen_at,metadata_json) VALUES(?,?,1,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?) ON CONFLICT(recommendation_key) DO UPDATE SET fingerprint=excluded.fingerprint,active=1,occurrence_count=excluded.occurrence_count,last_seen_at=CURRENT_TIMESTAMP,resolved_at=NULL,metadata_json=excluded.metadata_json",
+    ).bind(key, fp, occurrence || 1, metadataJson).run();
+  }
+  const activeRows = (await env.DB.prepare("SELECT id,recommendation_key FROM recommendations WHERE status='active'").all()).results;
+  for (const row of activeRows) if (!keys.has(String(row.recommendation_key))) {
+    await env.DB.prepare("UPDATE recommendations SET status='expired',resolved_at=CURRENT_TIMESTAMP WHERE id=?").bind(row.id).run();
+    await env.DB.prepare("UPDATE recommendation_lifecycle SET active=0,resolved_at=CURRENT_TIMESTAMP WHERE recommendation_key=?").bind(row.recommendation_key).run();
+  }
+  const inactive=(await env.DB.prepare("SELECT recommendation_key,fingerprint FROM recommendation_lifecycle WHERE active=0").all()).results;
+  for(const row of inactive) if(!keys.has(String(row.recommendation_key))&&!String(row.fingerprint).startsWith("cleared:"))
+    await env.DB.prepare("UPDATE recommendation_lifecycle SET fingerprint=? WHERE recommendation_key=? AND active=0").bind(`cleared:${row.fingerprint}`,row.recommendation_key).run();
+}
+
 async function recommendations(env) {
   const s = await settings(env, [
       "device_timeout_minutes",
       "max_power_alert_watts",
       "rain_alert_probability",
       "ventilation_humidity_threshold",
+      ...Object.keys(V5_DEFAULTS),
+      "bill_change_pct",
+      "bill_change_uah",
+      "day_tariff",
+      "night_tariff",
     ]),
     timeout = n(s.device_timeout_minutes, 15),
     data = await latestBundle(env),
@@ -603,7 +773,7 @@ async function recommendations(env) {
         action: "Відкрити вікно на 5–10 хв",
         room_id: z.device_id,
       });
-    if (z.humidity > 75 && z.temperature - insideDew < 4)
+    if (z.humidity >= n(s.climate_high_humidity_pct, 75) && z.temperature - insideDew < n(s.condensation_margin_c, 2))
       add({
         key: `mold:${z.device_id}`,
         category: "condensation",
@@ -613,6 +783,20 @@ async function recommendations(env) {
         action: "Провітрити й перевірити холодні поверхні",
         room_id: z.device_id,
       });
+  }
+  const anomalies = await runClimateAnomalyEngine(env, s);
+  for (const a of anomalies) {
+    let evidence = {};
+    try { evidence = JSON.parse(a.evidence_json || "{}"); } catch {}
+    const type = a.anomaly_type || a.type,
+      delta = n(a.delta ?? a.value),
+      name = a.device_name || a.device_id || "Датчик";
+    const message = type === "temperature_change"
+      ? `Температура ${delta < 0 ? "знизилась" : "зросла"} на ${Math.abs(delta)}°C за 30 хв.\nМожлива причина: відкрите вікно або зміна опалення.`
+      : type === "humidity_jump"
+        ? `Вологість змінилась на ${delta} п.п. за 30 хв.`
+        : `Вологість ${a.last_value ?? evidence.value}% залишається аномальною.`;
+    add({ key: a.anomaly_key || a.key, category: "climate_anomaly", priority: "warning", title: `Кліматична аномалія · ${name}`, message, action: "Перевірити кімнату й опалення.", room_id: a.device_id, evidence });
   }
   if (data.power && data.power.power > n(s.max_power_alert_watts, 5000) * 0.85)
     add({
@@ -626,44 +810,41 @@ async function recommendations(env) {
       message: `${data.power.power} Вт`,
       action: "Вимкнути некритичні прилади",
     });
-  const day = Math.max(1, +localDate(new Date()).slice(8, 10)),
-    days = new Date(
-      new Date().getFullYear(),
-      new Date().getMonth() + 1,
-      0,
-    ).getDate(),
-    estimate = +((stats.month.cost_total / day) * days).toFixed(2);
-  add({
-    key: "bill",
-    category: "cost",
-    priority: "info",
-    title: "Прогноз рахунку",
-    message: `Близько ${estimate} грн за місяць.`,
-    action: "Переглянути пікові години",
-  });
+  const today = localDate(new Date()),
+    day = Math.max(1, +today.slice(8, 10)),
+    [year, month] = today.split("-").map(Number),
+    days = new Date(year, month, 0).getDate(),
+    interval = Math.max(1, n(s.climate_expected_interval_min, 5)),
+    coverage = Math.min(1, stats.month.samples / Math.max(1, day * 24 * 60 / interval)),
+    sampleDayRate = stats.month.energy_day > 0 ? stats.month.cost_day / stats.month.energy_day : null,
+    sampleNightRate = stats.month.energy_night > 0 ? stats.month.cost_night / stats.month.energy_night : null,
+    bill = calculateBillForecast({
+      dayKwh: stats.month.energy_day,
+      nightKwh: stats.month.energy_night,
+      dayRate: s.day_tariff == null || s.day_tariff === "" ? null : n(s.day_tariff),
+      nightRate: s.night_tariff == null || s.night_tariff === "" ? null : n(s.night_tariff),
+      sampleDayRate,
+      sampleNightRate,
+      elapsedDays: day,
+      daysInMonth: days,
+      actualCost: stats.month.cost_total,
+      previousMonthCost: stats.previousMonth?.cost_total,
+      coverage,
+    }),
+    tariffKey = `${s.day_tariff ?? sampleDayRate ?? "?"}/${s.night_tariff ?? sampleNightRate ?? "?"}`,
+    billMeta = { date: today, tariff_key: tariffKey, forecast_cost: bill.forecastCost };
+  if (bill.available) {
+    const comparison = bill.deltaCost == null
+      ? "Порівняння з минулим місяцем: даних недостатньо."
+      : `Порівняно з минулим місяцем: ${bill.deltaCost >= 0 ? "+" : ""}${bill.deltaCost} грн.`;
+    add({
+      key: "bill", category: "cost", priority: "info", title: "💰 ПРОГНОЗ РАХУНКУ",
+      message: `Прогноз: ${bill.forecastCost} грн · впевненість: ${bill.confidence === "high" ? "висока" : bill.confidence === "medium" ? "середня" : "низька"}\nФакт за місяць: ${bill.actualCost} грн\nДень: ${bill.forecastDayCost} грн · ніч: ${bill.forecastNightCost} грн\n${comparison}`,
+      action: "Переглянути споживання день/ніч", bill,
+    });
+  }
   rows.sort((a, b) => b.score - a.score);
-  await env.DB.prepare(
-    "UPDATE recommendations SET status='expired',resolved_at=CURRENT_TIMESTAMP WHERE status='active'",
-  ).run();
-  if (rows.length)
-    await env.DB.batch(
-      rows.map((x) =>
-        env.DB.prepare(
-          "INSERT INTO recommendations(recommendation_key,category,priority,title,message,action,source,room_id,score,confidence,status,expires_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,'active',datetime('now','+2 hours'),'{}')",
-        ).bind(
-          x.key,
-          x.category,
-          x.priority,
-          x.title,
-          x.message,
-          x.action || null,
-          "engine",
-          x.room_id || null,
-          x.score,
-          x.confidence,
-        ),
-      ),
-    );
+  await persistRecommendations(env, rows, s, billMeta);
   const alerts = data.alerts,
     offline = data.zones.filter(
       (z) => ageMin(z.created_at) == null || ageMin(z.created_at) > timeout,
@@ -675,18 +856,21 @@ async function recommendations(env) {
             0,
           ) / indoor.length,
         )
-      : 0,
+      : null,
+    critical = alerts.filter((a) => a.severity === "critical").length,
     health = clamp(
       100 -
         offline * 15 -
-        alerts.filter((a) => a.severity === "critical").length * 20 -
+        critical * 20 -
         alerts.length * 3,
-    );
+    ),
+    scoreBreakdown = explainHomeScore({ comfort: indoor.length ? cs : null, offline, critical, alerts: alerts.length });
   return {
     scores: {
       comfort: cs,
       home_health: health,
-      overall: clamp(cs * 0.65 + health * 0.35),
+      overall: scoreBreakdown.overall,
+      breakdown: scoreBreakdown,
     },
     room_ranking: indoor
       .map((z) => ({
@@ -697,13 +881,13 @@ async function recommendations(env) {
         comfort_score: comfort(z.temperature, z.humidity, z.device_id),
       }))
       .sort((a, b) => b.comfort_score - a.comfort_score),
-    energy_forecast: { month_cost: estimate },
+    energy_forecast: bill,
     recommendations: rows,
   };
 }
 
 async function homeScoreSnapshot(env) {
-  const s = await settings(env, ["device_timeout_minutes"]),
+  const s = await settings(env, ["device_timeout_minutes", "day_tariff", "night_tariff", "climate_expected_interval_min"]),
     timeout = n(s.device_timeout_minutes, 15),
     data = await latestBundle(env),
     stats = await powerStats(env),
@@ -718,11 +902,12 @@ async function homeScoreSnapshot(env) {
             0,
           ) / indoor.length,
         )
-      : 0,
+      : null,
+    critical = data.alerts.filter((a) => a.severity === "critical").length,
     health = clamp(
       100 -
         offline * 15 -
-        data.alerts.filter((a) => a.severity === "critical").length * 20 -
+        critical * 20 -
         data.alerts.length * 3,
     ),
     day = Math.max(1, +localDate(new Date()).slice(8, 10)),
@@ -731,12 +916,26 @@ async function homeScoreSnapshot(env) {
       new Date().getMonth() + 1,
       0,
     ).getDate(),
-    estimate = +((stats.month.cost_total / day) * days).toFixed(2);
+    scoreBreakdown = explainHomeScore({ comfort: indoor.length ? cs : null, offline, critical, alerts: data.alerts.length }),
+    bill = calculateBillForecast({
+      dayKwh: stats.month.energy_day,
+      nightKwh: stats.month.energy_night,
+      dayRate: s.day_tariff == null || s.day_tariff === "" ? null : n(s.day_tariff),
+      nightRate: s.night_tariff == null || s.night_tariff === "" ? null : n(s.night_tariff),
+      sampleDayRate: stats.month.energy_day > 0 ? stats.month.cost_day / stats.month.energy_day : null,
+      sampleNightRate: stats.month.energy_night > 0 ? stats.month.cost_night / stats.month.energy_night : null,
+      elapsedDays: day,
+      daysInMonth: days,
+      actualCost: stats.month.cost_total,
+      previousMonthCost: stats.previousMonth?.cost_total,
+      coverage: Math.min(1, stats.month.samples / Math.max(1, day * 24 * 60 / Math.max(1, n(s.climate_expected_interval_min, 5)))),
+    });
   return {
     scores: {
       comfort: cs,
       home_health: health,
-      overall: clamp(cs * 0.65 + health * 0.35),
+      overall: scoreBreakdown.overall,
+      breakdown: scoreBreakdown,
     },
     room_ranking: indoor
       .map((z) => ({
@@ -747,7 +946,7 @@ async function homeScoreSnapshot(env) {
         comfort_score: comfort(z.temperature, z.humidity, z.device_id),
       }))
       .sort((a, b) => b.comfort_score - a.comfort_score),
-    energy_forecast: { month_cost: estimate },
+    energy_forecast: bill.available ? bill : { available: false, reason: bill.reason },
     recommendations: data.recs,
   };
 }
@@ -1638,10 +1837,14 @@ export default {
           success: true,
           ...(await homeScoreSnapshot(env)),
         }));
+      if (path === "/api/v1/sleep-score" && method === "GET") {
+        const row = await env.DB.prepare("SELECT * FROM house_sleep_scores ORDER BY sleep_date DESC LIMIT 1").first();
+        return json({ success: true, score: row ? { ...row, components: JSON.parse(row.components_json || "{}"), reasons: JSON.parse(row.reasons_json || "[]") } : null });
+      }
       if (path === "/api/v1/recommendations" && method === "GET")
         return cachedJson(request, 300, async () => {
           const r = await env.DB.prepare(
-            "SELECT * FROM recommendations WHERE status='active' ORDER BY score DESC LIMIT 50",
+            "SELECT r.*,l.fingerprint,l.occurrence_count,l.first_seen_at,l.last_seen_at,l.last_notified_at,l.snooze_until FROM recommendations r LEFT JOIN recommendation_lifecycle l ON l.recommendation_key=r.recommendation_key WHERE r.status='active' AND (l.snooze_until IS NULL OR l.snooze_until<=CURRENT_TIMESTAMP) ORDER BY r.score DESC LIMIT 50",
           ).all();
           return { success: true, recommendations: r.results };
         });
@@ -2587,6 +2790,7 @@ export default {
         await updateWeather(env);
         await evaluateAlerts(env);
         await recommendations(env);
+        await calculateLatestSleepScore(env);
         const s = await homeScoreSnapshot(env),
           d = await latestBundle(env),
           zones = d.zones.filter((z) => !z.is_outdoor),
@@ -2594,7 +2798,7 @@ export default {
             (z) => ageMin(z.created_at) != null && ageMin(z.created_at) <= 15,
           ).length,
           device = clamp(zones.length ? (online / zones.length) * 100 : 100),
-          energy = d.power?.power > 5000 ? 55 : d.power?.power > 3500 ? 75 : 95,
+          energy = null,
           weather = d.weather ? 90 : 50;
         await env.DB.prepare(
           "INSERT INTO home_score_history(comfort_score,energy_score,weather_score,device_score,overall_score) VALUES(?,?,?,?,?)",
