@@ -330,23 +330,26 @@ async function tariff(env) {
   };
 }
 async function periodStats(env, start, end = null) {
+  // Keep the counter sample immediately before the period separate from the
+  // in-period range. Combining these with OR made SQLite scan all power_logs
+  // for every day/month calculation, even when only a handful of rows matched.
   const r = await env.DB.prepare(
     end
-      ? "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE (created_at>=? AND created_at<?) OR id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at"
-      : "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE created_at>=? OR id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at",
+      ? "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE created_at>=? AND created_at<? UNION ALL SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at"
+      : "SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE created_at>=? UNION ALL SELECT energy_total,tariff_zone,cost_per_kwh,created_at FROM power_logs WHERE id=(SELECT id FROM power_logs WHERE created_at<? ORDER BY created_at DESC LIMIT 1) ORDER BY created_at",
   )
     .bind(...(end ? [start, end, start] : [start, start]))
     .all();
+  const rows = r.results;
   let day = 0,
     night = 0,
     costDay = 0,
     costNight = 0;
-  for (let i = 1; i < r.results.length; i++) {
-    if (String(r.results[i].created_at) < start || (end && String(r.results[i].created_at) >= end)) continue;
-    const d = n(r.results[i].energy_total) - n(r.results[i - 1].energy_total);
+  for (let i = 1; i < rows.length; i++) {
+    const d = n(rows[i].energy_total) - n(rows[i - 1].energy_total);
     if (!Number.isFinite(d) || d < 0) continue;
-    const cost = d * n(r.results[i].cost_per_kwh);
-    if (r.results[i].tariff_zone === "night") {
+    const cost = d * n(rows[i].cost_per_kwh);
+    if (rows[i].tariff_zone === "night") {
       night += d;
       costNight += cost;
     } else {
@@ -361,7 +364,7 @@ async function periodStats(env, start, end = null) {
     cost_day: +costDay.toFixed(2),
     cost_night: +costNight.toFixed(2),
     cost_total: +(costDay + costNight).toFixed(2),
-    samples: r.results.length,
+    samples: rows.length,
   };
 }
 function kyivOffsetMinutes(d = new Date()) {

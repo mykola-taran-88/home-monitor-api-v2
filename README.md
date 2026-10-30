@@ -6,6 +6,8 @@ Cloudflare Worker for the Home Monitor API. The API, bot, and dashboard share th
 
 `migrations/0001_home_monitor_v5.sql` adds the v5 runtime state for scheduler deduplication, recommendation lifecycle and feedback, event grouping, climate anomalies, AI Caretaker traces, and nightly Sleep Score. It inserts v5 thresholds using `ON CONFLICT DO NOTHING`, preserving values already configured by the owner. It removes the retired notification category settings `rain_window`, `home_score`, and `ventilation`; export or back up D1 first if those rows need to be restored for rollback.
 
+`migrations/0002_power_logs_created_at_index.sql` adds an index to the existing `power_logs.created_at` column. Apply it only after the Home Monitor API core schema has created `power_logs`. The index lets power statistics read the requested time range and one preceding meter sample without scanning the entire telemetry table.
+
 The migration creates the settings and notification configuration tables when missing, so it is safe to apply before the Workers' first request on a fresh D1. The rest of the API's sensor, telemetry, and recommendation core schema remains managed by the existing Home Monitor API/bootstrap. The migration is idempotent and tested against both empty D1 and representative legacy v4 settings.
 
 ### Preview deployment
